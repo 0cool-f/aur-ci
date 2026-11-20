@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: 0BSD
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    commit-message:
+      prefix: ci
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /check
+    commit-message:
+      prefix: ci
+    schedule:
+      interval: weekly
