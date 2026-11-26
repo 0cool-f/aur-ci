@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: aur-ci check
+description: Builds the package in a git checkout, runs namcap and verifies or rewrites .SRCINFO.
+
+inputs:
+  path:
+    description: Directory of the package checkout, relative to the workspace
+    default: "."
+  update-sums:
+    description: Refresh the PKGBUILD checksums and rewrite .SRCINFO
+    default: "false"
+  write-srcinfo:
+    description: Rewrite .SRCINFO instead of failing when it is out of date
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PKG_PATH: ${{ inputs.path }}
+        UPDATE_SUMS: ${{ inputs.update-sums }}
+        WRITE_SRCINFO: ${{ inputs.write-srcinfo }}
+      run: |
+        args=()
+        [[ "$UPDATE_SUMS" == true ]] && args+=(--update-sums)
+        [[ "$WRITE_SRCINFO" == true ]] && args+=(--write-srcinfo)
+        "$GITHUB_ACTION_PATH/check.sh" "${args[@]}" "$GITHUB_WORKSPACE/$PKG_PATH"

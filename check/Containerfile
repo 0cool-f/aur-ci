@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+FROM docker.io/library/archlinux:base-20261122.0.629543@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
+
+RUN pacman -Syu --noconfirm --disable-sandbox base-devel namcap pacman-contrib \
+    && sed -i "s/^OPTIONS=(\(.*\) debug/OPTIONS=(\1 !debug/" /etc/makepkg.conf \
+    && useradd -m builder

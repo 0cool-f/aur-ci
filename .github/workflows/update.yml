@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Moves an AUR package to the version printed by the caller's ci/latest.sh. The bump job reads and
+# builds the AUR repository anonymously; only the publish job, in the `aur` environment, can push.
+name: update
+
+on:
+  workflow_call:
+    inputs:
+      pkgbase:
+        description: AUR package base to update
+        required: true
+        type: string
+      update-sums:
+        description: Refresh the PKGBUILD checksums with updpkgsums after the version bump
+        type: boolean
+        default: true
+      dry-run:
+        description: Build the update without publishing it
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  PKGBASE: ${{ inputs.pkgbase }}
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+      base: ${{ steps.aur.outputs.base }}
+      patch: ${{ steps.patch.outputs.patch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: updater
+          persist-credentials: false
+
+      - name: Clone the AUR repository read-only
+        id: aur
+        run: |
+          git clone "https://aur.archlinux.org/$PKGBASE.git" aur
+          [ -s aur/.SRCINFO ] || { echo "::error::$PKGBASE has no .SRCINFO on the AUR"; exit 1; }
+          echo "base=$(git -C aur rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Find a newer upstream release
+        id: latest
+        run: |
+          latest=$(updater/ci/latest.sh)
+          current=$(sed -n 's/^\tpkgver = //p' aur/.SRCINFO)
+          if [ -z "$latest" ]; then
+            echo "No downloadable upstream release found (AUR: $current)"
+            exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)" = "$current" ]; then
+            echo "$current is up to date (upstream: $latest)"
+            exit 0
+          fi
+          echo "Updating $current -> $latest"
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Move PKGBUILD to the new version
+        id: apply
+        if: steps.latest.outputs.version != ''
+        working-directory: aur
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          notes=$RUNNER_TEMP/notes.md
+          if [ -x ../updater/ci/update.sh ]; then
+            result=$(../updater/ci/update.sh "$VERSION" "$notes")
+          else
+            sed -i -e "s/^pkgver=.*/pkgver=$VERSION/" -e "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+            echo "Upstream version $VERSION." > "$notes"
+            result=match
+          fi
+          { echo "result=$result"; echo "notes=$notes"; } >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue when ci/update.sh asks for review
+        if: steps.latest.outputs.version != '' && steps.apply.outputs.result != 'match'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.latest.outputs.version }}
+          NOTES: ${{ steps.apply.outputs.notes }}
+        run: |
+          title="$PKGBASE $VERSION needs review"
+          if [ -n "$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+            echo "::warning::Issue \"$title\" is already open"
+          else
+            gh issue create --title "$title" --body-file "$NOTES"
+          fi
+          echo "::error::$title, not published"
+          exit 1
+
+      - name: Build, run namcap and rewrite .SRCINFO
+        if: steps.latest.outputs.version != ''
+        uses: 0cool-f/aur-ci/check@v1
+        with:
+          path: aur
+          update-sums: ${{ inputs.update-sums }}
+          write-srcinfo: "true"
+
+      - name: Export the change
+        id: patch
+        if: steps.latest.outputs.version != ''
+        working-directory: aur
+        run: |
+          git add -A
+          git diff --cached --stat | tee -a "$GITHUB_STEP_SUMMARY"
+          git diff --cached
+          echo "patch=$(git diff --cached --binary | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: bump
+    if: needs.bump.outputs.version != '' && !inputs.dry-run
+    runs-on: ubuntu-latest
+    environment: aur
+    permissions: {}
+    steps:
+      - name: Commit and push to the AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ needs.bump.outputs.version }}
+          BASE: ${{ needs.bump.outputs.base }}
+          PATCH: ${{ needs.bump.outputs.patch }}
+        run: |
+          [ -n "$AUR_SSH_PRIVATE_KEY" ] || { echo "::error::AUR_SSH_PRIVATE_KEY is not set in the aur environment"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Verify against the SSH fingerprints listed at https://aur.archlinux.org/ before changing it.
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+
+          git clone "ssh://aur@aur.archlinux.org/$PKGBASE.git" aur
+          cd aur
+          if [ "$(git rev-parse HEAD)" != "$BASE" ]; then
+            echo "::error::The AUR repository changed after the build; the next run starts from the new state"
+            exit 1
+          fi
+          printf '%s' "$PATCH" | base64 -d | git apply --index
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore: update to $VERSION"
+          git push origin HEAD:master
